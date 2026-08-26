@@ -101,7 +101,7 @@ def ask_qwen(
     max_new_tokens: int = 128,
 ) -> str:
     tokenizer, model = load_qwen(model_dir)
-    messages = [{"role": "system", "content": "РћС‚РІРµС‡Р°Р№ РїРѕ-СЂСѓСЃСЃРєРё, РєСЂР°С‚РєРѕ Рё РїРѕРЅСЏС‚РЅРѕ. РќРµ РїРµСЂРµРІРѕРґРё РѕС‚РІРµС‚ РЅР° Р»РµР·РіРёРЅСЃРєРёР№."}]
+    messages = [{"role": "system", "content": "Отвечай по-русски, кратко и понятно. Не переводи ответ на лезгинский."}]
     messages.extend((history or [])[-8:])
     messages.append({"role": "user", "content": text})
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -127,7 +127,7 @@ def stream_qwen(
     max_new_tokens: int = 128,
 ) -> str:
     tokenizer, model = load_qwen(model_dir)
-    messages = [{"role": "system", "content": "РћС‚РІРµС‡Р°Р№ РїРѕ-СЂСѓСЃСЃРєРё, РєСЂР°С‚РєРѕ Рё РїРѕРЅСЏС‚РЅРѕ. РќРµ РїРµСЂРµРІРѕРґРё РѕС‚РІРµС‚ РЅР° Р»РµР·РіРёРЅСЃРєРёР№."}]
+    messages = [{"role": "system", "content": "Отвечай по-русски, кратко и понятно. Не переводи ответ на лезгинский."}]
     messages.extend((history or [])[-8:])
     messages.append({"role": "user", "content": text})
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -211,7 +211,7 @@ def speak_text(text: str, language: str):
 class TranslatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("gadz-instruct-lzg | Р›РµР·РіРёРЅСЃРєРёР№ AI-С‡Р°С‚")
+        self.root.title("gadz-instruct-lzg | Лезгинский AI-чат")
         self.root.geometry("900x680")
         self.root.minsize(620, 480)
         self.root.configure(bg="#eef2f6")
@@ -227,14 +227,14 @@ class TranslatorApp:
         header = ttk.Frame(root, padding=(18, 14, 18, 14), style="Header.TFrame")
         header.pack(fill="x")
         ttk.Label(header, text="gadz-instruct-lzg", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="  Р›РµР·РіРёРЅСЃРєРёР№ AI-С‡Р°С‚", style="Subtitle.TLabel").pack(side="left", pady=(4, 0))
-        ttk.Label(header, text="РЇР·С‹Рє РѕС‚РІРµС‚Р°:").pack(side="right", padx=(10, 6))
-        self.answer_combo = ttk.Combobox(header, width=12, state="readonly", values=["Р›РµР·РіРёРЅСЃРєРёР№", "Р СѓСЃСЃРєРёР№"])
-        self.answer_combo.set("Р›РµР·РіРёРЅСЃРєРёР№")
+        ttk.Label(header, text="  Лезгинский AI-чат", style="Subtitle.TLabel").pack(side="left", pady=(4, 0))
+        ttk.Label(header, text="Язык ответа:").pack(side="right", padx=(10, 6))
+        self.answer_combo = ttk.Combobox(header, width=12, state="readonly", values=["Лезгинский", "Русский"])
+        self.answer_combo.set("Лезгинский")
         self.answer_combo.pack(side="right")
-        self.speak_btn = ttk.Button(header, text="РћР·РІСѓС‡РёС‚СЊ РѕС‚РІРµС‚", command=self.speak_last_answer, state="disabled")
+        self.speak_btn = ttk.Button(header, text="Озвучить ответ", command=self.speak_last_answer, state="disabled")
         self.speak_btn.pack(side="right", padx=(8, 0))
-        ttk.Button(header, text="РќРѕРІС‹Р№ С‡Р°С‚", command=self.clear_chat).pack(side="right")
+        ttk.Button(header, text="Новый чат", command=self.clear_chat).pack(side="right")
 
         chat_frame = ttk.Frame(root, padding=(18, 14, 18, 10), style="App.TFrame")
         chat_frame.pack(fill="both", expand=True)
@@ -262,10 +262,10 @@ class TranslatorApp:
         self.input_text = tk.Text(input_frame, height=3, wrap="word", font=("Segoe UI", 12))
         self.input_text.pack(side="left", fill="both", expand=True)
         self.input_text.bind("<Return>", self.on_enter)
-        self.send_btn = ttk.Button(input_frame, text="РћС‚РїСЂР°РІРёС‚СЊ", command=self.answer_now)
+        self.send_btn = ttk.Button(input_frame, text="Отправить", command=self.answer_now)
         self.send_btn.pack(side="right", fill="y", padx=(8, 0))
 
-        self.status_var = tk.StringVar(value="Р“РѕС‚РѕРІРѕ")
+        self.status_var = tk.StringVar(value="Готово")
         ttk.Label(root, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w", padx=18, pady=(0, 12))
 
         self._busy = False
@@ -287,13 +287,13 @@ class TranslatorApp:
             return
 
         self._busy = True
-        answer_lang = "rus_Cyrl" if self.answer_combo.get() == "Р СѓСЃСЃРєРёР№" else "lez_Cyrl"
-        self.status_var.set("РџРµСЂРµРІРѕР¶Сѓ Рё С„РѕСЂРјРёСЂСѓСЋ РѕС‚РІРµС‚...")
+        answer_lang = "rus_Cyrl" if self.answer_combo.get() == "Русский" else "lez_Cyrl"
+        self.status_var.set("Перевожу и формирую ответ...")
         self.send_btn.state(["disabled"])
         self.input_text.delete("1.0", "end")
-        self.add_message("Р’С‹", text, "user")
+        self.add_message("Вы", text, "user")
         if answer_lang == "rus_Cyrl":
-            self.add_message("РђСЃСЃРёСЃС‚РµРЅС‚", "", "bot")
+            self.add_message("Ассистент", "", "bot")
             self.streaming_start = self.chat_text.index("end-1c")
             self.stream_closed = False
         self.streaming_answer = ""
@@ -317,7 +317,7 @@ class TranslatorApp:
                     {"role": "assistant", "content": russian_answer},
                 ])
             except Exception as exc:
-                result = f"РћС€РёР±РєР°: {exc}"
+                result = f"Ошибка: {exc}"
             self.root.after(0, lambda: self.show_result(result, streamed=answer_lang == "rus_Cyrl"))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -340,7 +340,7 @@ class TranslatorApp:
         self.chat_text.see("end")
 
     def show_result(self, result, streamed=False):
-        tag = "error" if result.startswith("РћС€РёР±РєР°:") else "bot"
+        tag = "error" if result.startswith("Ошибка:") else "bot"
         if streamed:
             self.chat_text.configure(state="normal")
             self.stream_closed = True
@@ -351,26 +351,26 @@ class TranslatorApp:
                 self.chat_text.insert("end", f"{result}\n\n")
             self.chat_text.configure(state="disabled")
         elif tag == "bot":
-            self.add_message("РђСЃСЃРёСЃС‚РµРЅС‚", "", tag)
+            self.add_message("Ассистент", "", tag)
             self.streaming_answer = ""
             self.stream_closed = False
             self.stream_final_answer(result)
         else:
-            self.add_message("РђСЃСЃРёСЃС‚РµРЅС‚", result, tag)
+            self.add_message("Ассистент", result, tag)
         self.last_answer = "" if tag == "error" else result
         self.speak_btn.state(["!disabled"] if self.last_answer else ["disabled"])
         if streamed or tag == "error":
-            self.status_var.set("Р“РѕС‚РѕРІРѕ")
+            self.status_var.set("Готово")
             self.send_btn.state(["!disabled"])
             self._busy = False
         else:
-            self.status_var.set("Р’С‹РІРѕР¶Сѓ РѕС‚РІРµС‚...")
+            self.status_var.set("Вывожу ответ...")
 
     def stream_final_answer(self, text, position=0):
         if position >= len(text):
             self.append_stream("\n\n")
             self.stream_closed = True
-            self.status_var.set("Р“РѕС‚РѕРІРѕ")
+            self.status_var.set("Готово")
             self.send_btn.state(["!disabled"])
             self._busy = False
             return
@@ -381,17 +381,17 @@ class TranslatorApp:
     def speak_last_answer(self):
         if not self.last_answer or self._busy:
             return
-        language = "rus" if self.answer_combo.get() == "Р СѓСЃСЃРєРёР№" else "lez_Cyrl"
+        language = "rus" if self.answer_combo.get() == "Русский" else "lez_Cyrl"
         self._busy = True
         self.speak_btn.state(["disabled"])
-        self.status_var.set("РћР·РІСѓС‡РёРІР°СЋ СЂСѓСЃСЃРєРёР№ РѕС‚РІРµС‚..." if language == "rus" else "РћР·РІСѓС‡РёРІР°СЋ Р»РµР·РіРёРЅСЃРєРёР№ РѕС‚РІРµС‚...")
+        self.status_var.set("Озвучиваю русский ответ..." if language == "rus" else "Озвучиваю лезгинский ответ...")
 
         def worker():
             try:
                 speak_text(self.last_answer, language)
-                status = "Р“РѕС‚РѕРІРѕ"
+                status = "Готово"
             except Exception as exc:
-                status = f"РћС€РёР±РєР° РѕР·РІСѓС‡РєРё: {exc}"
+                status = f"Ошибка озвучки: {exc}"
             self.root.after(0, lambda: self.finish_speaking(status))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -410,7 +410,7 @@ class TranslatorApp:
         self.chat_text.configure(state="normal")
         self.chat_text.delete("1.0", "end")
         self.chat_text.configure(state="disabled")
-        self.status_var.set("РќРѕРІС‹Р№ С‡Р°С‚")
+        self.status_var.set("Новый чат")
 
 
 def main():
