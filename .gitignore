@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Python
 .venv/
 __pycache__/
@@ -17,3 +18,24 @@ lezgi-nllb-600m-200k-syntetics/
 # Secrets
 .env
 *.token
+=======
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local model weights and caches
+models/*
+!models/.gitkeep
+lezgi-nllb-600m-200k-syntetics/
+.cache/
+
+# Runtime audio and editor files
+*.wav
+.vscode/*.log
+
+# Secrets
+.env
+*.token
+>>>>>>> 077917b28d963efa3cca55c050773a03013cebe3

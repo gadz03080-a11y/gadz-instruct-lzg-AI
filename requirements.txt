@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Install PyTorch separately if a specific CUDA build is needed.
 torch>=2.7
 transformers>=4.46,<6
@@ -6,3 +7,13 @@ bitsandbytes>=0.45
 soundfile>=0.12
 piper-tts>=1.7
 huggingface-hub>=0.27
+=======
+# Install PyTorch separately if a specific CUDA build is needed.
+torch>=2.7
+transformers>=4.46,<6
+accelerate>=1.0
+bitsandbytes>=0.45
+soundfile>=0.12
+piper-tts>=1.7
+huggingface-hub>=0.27
+>>>>>>> 077917b28d963efa3cca55c050773a03013cebe3
