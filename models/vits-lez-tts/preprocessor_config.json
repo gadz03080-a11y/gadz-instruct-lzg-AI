@@ -1,0 +1,11 @@
+{
+  "feature_extractor_type": "VitsFeatureExtractor",
+  "feature_size": 80,
+  "hop_length": 256,
+  "max_wav_value": 32768.0,
+  "n_fft": 1024,
+  "padding_side": "right",
+  "padding_value": 0.0,
+  "return_attention_mask": false,
+  "sampling_rate": 16000
+}
