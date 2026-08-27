@@ -1,0 +1,2 @@
+html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
+body { min-height: 100vh; font-family: "Segoe UI", "Trebuchet MS", sans-serif; }

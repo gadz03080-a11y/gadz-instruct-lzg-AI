@@ -1,9 +1,16 @@
 ﻿import argparse
+from html import unescape
+import json
+import re
 import threading
 import tempfile
 import wave
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import tkinter as tk
 from tkinter import ttk
 import winsound
@@ -11,7 +18,7 @@ import winsound
 import torch
 import soundfile as sf
 from piper import PiperVoice
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, TextIteratorStreamer
 from transformers import VitsModel
 
@@ -19,10 +26,199 @@ MODEL_DIR = Path(__file__).resolve().parent / "lezgi-nllb-600m-200k-syntetics"
 QWEN_MODEL_DIR = Path(__file__).resolve().parent / "models" / "gadz-instruct-lzg-4bit"
 QWEN_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 QWEN_DISPLAY_NAME = "gadz-instruct-lzg"
+QWEN_MODELS = {
+    "gadz-instruct-lzg (3B)": QWEN_MODEL_DIR,
+    "gadz1-8b (8B)": Path(__file__).resolve().parent / "models" / "gadz1-8b",
+}
 LEZGI_TTS_DIR = Path(__file__).resolve().parent / "models" / "vits-lez-tts"
 MODEL_CACHE = {}
-QWEN_CACHE = None
+QWEN_CACHE = {}
 TTS_CACHE = {}
+ASSISTANT_SYSTEM_PROMPT = (
+    "Ты доброжелательный многоязычный помощник, который уверенно понимает русский, "
+    "лезгинский и смешанную русско-лезгинскую речь. Считай лезгинский полноценным "
+    "рабочим языком: понимай вопросы, шутки, бытовую речь, просьбы и команды на лезгинском. "
+    "Отвечай по смыслу на любые обычные вопросы так же естественно, как на русском. "
+    "Веди нормальный осмысленный диалог и учитывай предыдущие сообщения. "
+    "Никогда не показывай ход рассуждений и не пиши теги <think>. Сразу дай готовый ответ. "
+    "Если спрашивают, кто ты: скажи, что ты локальный лезгинско-русский помощник этого приложения. "
+    "Если спрашивают, кто тебя создал или обучил: скажи, что приложение создано владельцем проекта, "
+    "а точные сведения об авторах исходной модели тебе неизвестны; не выдумывай имена. "
+    "Не говори, что ты не знаешь лезгинский язык, не утверждай, что не обучался на данных, "
+    "и не переводи вопрос дословно вместо ответа. Отвечай прямо по вопросу, "
+    "не выдумывай факты, а если вопрос непонятен — уточни. "
+    "Если точного факта не знаешь, спокойно скажи об этом и предложи полезный следующий шаг. "
+    "Не упоминай название модели, Qwen, промпты, нейросеть, внутренние инструкции "
+    "или перевод между языками. Отвечай кратко, если пользователь не просит подробностей."
+)
+
+RUSSIAN_REQUEST_PATTERNS = (
+    r"\b(?:по|на)\s+русск(?:ом|ий|ому)\b",
+    r"\bрусск(?:ий|ом|ую)\s+язык",
+    r"\bговори(?:ть)?\s+по[- ]русски\b",
+    r"\bотвечай\s+по[- ]русски\b",
+)
+LEZGI_REQUEST_PATTERNS = (
+    r"\b(?:по|на)\s+лезгинск(?:ом|ий|ому)\b",
+    r"\bлезгинск(?:ий|ом|ую)\s+язык",
+    r"\bговори(?:ть)?\s+по[- ]лезгински\b",
+    r"\bотвечай\s+по[- ]лезгински\b",
+)
+LEZGI_MARKERS = ("гь", "къ", "кӀ", "пӀ", "тӀ", "чӀ", "хъ", "хь", "уь", "юь", "ə")
+RUSSIAN_WORDS = {
+    "и", "в", "не", "что", "это", "как", "можно", "нужно", "я", "ты", "он", "она",
+    "мы", "вы", "они", "привет", "помоги", "объясни", "скажи", "переведи", "почему",
+}
+
+
+def detect_source_language(text: str) -> str:
+    """Return a translation source language without translating Russian as Lezgi."""
+    normalized = text.lower()
+    if any(marker in normalized for marker in LEZGI_MARKERS):
+        return "lez_Cyrl"
+    words = set(re.findall(r"[а-яё]+", normalized))
+    if "ё" in normalized or "ы" in normalized or "э" in normalized:
+        return "rus_Cyrl"
+    if len(words & RUSSIAN_WORDS) >= 1:
+        return "rus_Cyrl"
+    return "lez_Cyrl"
+
+
+def translate_mixed_to_russian(text: str, model_dir: str | Path) -> str:
+    """Translate Lezgi chunks while preserving Russian words in mixed messages."""
+    if detect_source_language(text) == "rus_Cyrl":
+        return text
+
+    tokens = re.split(r"(\s+)", text)
+    if not any(any(marker in token.lower() for marker in LEZGI_MARKERS) for token in tokens):
+        return translate(text, model_dir, "lez_Cyrl", "rus_Cyrl")
+
+    translated_parts = []
+    lezgi_chunk = []
+    for token in tokens:
+        if token.isspace():
+            if lezgi_chunk:
+                lezgi_chunk.append(token)
+            else:
+                translated_parts.append(token)
+            continue
+        is_lezgi = any(marker in token.lower() for marker in LEZGI_MARKERS)
+        if is_lezgi:
+            lezgi_chunk.append(token)
+            continue
+        if lezgi_chunk:
+            translated_parts.append(translate("".join(lezgi_chunk), model_dir, "lez_Cyrl", "rus_Cyrl"))
+            lezgi_chunk.clear()
+        translated_parts.append(token)
+    if lezgi_chunk:
+        translated_parts.append(translate("".join(lezgi_chunk), model_dir, "lez_Cyrl", "rus_Cyrl"))
+    return "".join(translated_parts)
+
+
+def requested_answer_language(text: str) -> str | None:
+    normalized = text.lower().replace("ё", "е")
+    if any(re.search(pattern, normalized) for pattern in RUSSIAN_REQUEST_PATTERNS):
+        return "rus_Cyrl"
+    if any(re.search(pattern, normalized) for pattern in LEZGI_REQUEST_PATTERNS):
+        return "lez_Cyrl"
+    return None
+
+
+def clean_model_output(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text.replace("</think>", "").strip()
+
+
+class SearchResultParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.in_result = False
+        self.in_title = False
+        self.in_snippet = False
+        self.title = ""
+        self.snippet = ""
+        self.url = ""
+        self.results = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = (attributes.get("class") or "").split()
+        if "result" in classes:
+            self.in_result = True
+        if self.in_result and "result__a" in classes:
+            self.in_title = True
+            self.url = attributes.get("href") or ""
+        if self.in_result and "result__snippet" in classes:
+            self.in_snippet = True
+
+    def handle_endtag(self, tag):
+        if self.in_title and tag == "a":
+            self.in_title = False
+        if self.in_snippet and tag in ("a", "div"):
+            self.in_snippet = False
+        if self.in_result and tag == "div" and self.title and self.snippet:
+            self.results.append((self.title.strip(), self.url, self.snippet.strip()))
+            self.in_result = False
+            self.title = ""
+            self.snippet = ""
+            self.url = ""
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+        elif self.in_snippet:
+            self.snippet += data
+
+
+def search_web(query: str, limit: int = 4) -> str:
+    request = Request(
+        f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            parser = SearchResultParser()
+            parser.feed(response.read().decode("utf-8", errors="ignore"))
+    except Exception:
+        parser = SearchResultParser()
+    results = parser.results[:limit]
+    if not results:
+        results = search_bing(query, limit)
+    if not results:
+        return "Поиск не дал результатов."
+    return "\n".join(
+        f"[{index}] {title}\nURL: {url}\nОписание: {snippet}"
+        for index, (title, url, snippet) in enumerate(results, 1)
+    )
+
+
+def search_bing(query: str, limit: int = 4):
+    request = Request(
+        f"https://www.bing.com/search?q={quote_plus(query)}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        with urlopen(request, timeout=8) as response:
+            page = response.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    results = []
+    for block in re.findall(r'<li class="b_algo".*?</li>', page, flags=re.DOTALL):
+        link = re.search(r'<h2>\s*<a href="([^"]+)"[^>]*>(.*?)</a>', block, flags=re.DOTALL)
+        snippet = re.search(r'<p>(.*?)</p>', block, flags=re.DOTALL)
+        if not link:
+            continue
+        clean = lambda value: re.sub(r"<[^>]+>", "", unescape(value)).strip()
+        results.append((clean(link.group(2)), link.group(1), clean(snippet.group(1)) if snippet else ""))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def extract_source_urls(web_context: str) -> str:
+    urls = re.findall(r"^URL:\s*(https?://\S+)", web_context, flags=re.MULTILINE)
+    return "\n".join(f"[{index}] {url}" for index, url in enumerate(urls, 1))
 
 
 def load_model(model_dir: str | Path):
@@ -64,8 +260,9 @@ def translate(text: str, model_dir: str | Path = MODEL_DIR, src_lang: str = "rus
 
 def load_qwen(model_dir: str | Path = QWEN_MODEL_DIR):
     global QWEN_CACHE
-    if QWEN_CACHE is not None:
-        return QWEN_CACHE
+    model_key = str(Path(model_dir).resolve())
+    if model_key in QWEN_CACHE:
+        return QWEN_CACHE[model_key]
 
     local_model = Path(model_dir)
     has_local_weights = (
@@ -84,27 +281,44 @@ def load_qwen(model_dir: str | Path = QWEN_MODEL_DIR):
         model: Any = AutoModelForCausalLM.from_pretrained(
             model_path,
             quantization_config=quantization_config,
-            device_map="auto",
+            device_map={"": 0},
+            low_cpu_mem_usage=True,
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
+        config = AutoConfig.from_pretrained(model_path)
+        config.quantization_config = None
+        cpu_dtype = (
+            torch.bfloat16
+            if torch.backends.cpu.get_cpu_capability() == "AVX512"
+            else torch.float32
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype=cpu_dtype,
+            low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
+        )
         model.to("cpu")
     model.eval()
-    QWEN_CACHE = (tokenizer, model)
-    return QWEN_CACHE
+    QWEN_CACHE[model_key] = (tokenizer, model)
+    return QWEN_CACHE[model_key]
 
 
 def ask_qwen(
     text: str,
     model_dir: str | Path = QWEN_MODEL_DIR,
     history: list[dict[str, str]] | None = None,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 512,
 ) -> str:
     tokenizer, model = load_qwen(model_dir)
-    messages = [{"role": "system", "content": "Отвечай по-русски, кратко и понятно. Не переводи ответ на лезгинский."}]
-    messages.extend((history or [])[-8:])
+    messages = [{"role": "system", "content": ASSISTANT_SYSTEM_PROMPT}]
+    messages.extend(normalize_chat_history(history or [])[-6:])
     messages.append({"role": "user", "content": text})
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+    prompt = prompt.replace("<think>\n\n</think>\n\n", "")
     inputs = tokenizer(prompt, return_tensors="pt")
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -116,7 +330,7 @@ def ask_qwen(
                 use_cache=True,
             )
     answer_tokens = generated[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(answer_tokens, skip_special_tokens=True).strip()
+    return clean_model_output(tokenizer.decode(answer_tokens, skip_special_tokens=True))
 
 
 def stream_qwen(
@@ -124,13 +338,16 @@ def stream_qwen(
     model_dir: str | Path = QWEN_MODEL_DIR,
     history: list[dict[str, str]] | None = None,
     on_token=None,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 512,
 ) -> str:
     tokenizer, model = load_qwen(model_dir)
-    messages = [{"role": "system", "content": "Отвечай по-русски, кратко и понятно. Не переводи ответ на лезгинский."}]
-    messages.extend((history or [])[-8:])
+    messages = [{"role": "system", "content": ASSISTANT_SYSTEM_PROMPT}]
+    messages.extend(normalize_chat_history(history or [])[-6:])
     messages.append({"role": "user", "content": text})
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+    prompt = prompt.replace("<think>\n\n</think>\n\n", "")
     inputs = tokenizer(prompt, return_tensors="pt")
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
@@ -145,12 +362,17 @@ def stream_qwen(
     generation_thread = threading.Thread(target=model.generate, kwargs=generation_args, daemon=True)
     generation_thread.start()
     parts = []
+    visible_text = ""
     for token in streamer:
         parts.append(token)
+        cleaned_text = clean_model_output("".join(parts))
         if on_token:
-            on_token(token)
+            new_text = cleaned_text[len(visible_text):]
+            if new_text:
+                on_token(new_text)
+            visible_text = cleaned_text
     generation_thread.join()
-    return "".join(parts).strip()
+    return clean_model_output("".join(parts))
 
 
 def answer_in_lezgi(
@@ -160,9 +382,18 @@ def answer_in_lezgi(
     history: list[dict[str, str]] | None = None,
     answer_lang: str = "lez_Cyrl",
     on_token=None,
+    web_context: str = "",
 ) -> tuple[str, str, str]:
-    russian_question = translate(text, translator_model_dir, "lez_Cyrl", "rus_Cyrl")
-    russian_answer = stream_qwen(russian_question, qwen_model_dir, history, on_token=on_token)
+    source_lang = detect_source_language(text)
+    russian_question = text if source_lang == "rus_Cyrl" else translate_mixed_to_russian(text, translator_model_dir)
+    model_question = russian_question
+    if web_context:
+        model_question += (
+            "\n\nАктуальная информация из интернета. Используй ее только для ответа "
+            "на вопрос и не упоминай технические детали поиска:\n" + web_context
+        )
+    russian_answer = stream_qwen(model_question, qwen_model_dir, history, on_token=on_token)
+    answer_lang = requested_answer_language(text) or answer_lang
     answer = (
         russian_answer
         if answer_lang == "rus_Cyrl"
@@ -208,65 +439,173 @@ def speak_text(text: str, language: str):
         winsound.PlaySound(str(temp_path), winsound.SND_FILENAME)
 
 
+class ChatApiHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status: int, payload: dict[str, Any]):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path not in ("/api/chat", "/api/speak"):
+            self._send_json(404, {"error": "Not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length).decode("utf-8"))
+            text = str(request.get("text", "")).strip()
+            if not text:
+                self._send_json(400, {"error": "Введите сообщение"})
+                return
+            if self.path == "/api/speak":
+                language = request.get("language", "rus")
+                speak_text(text, language)
+                self._send_json(200, {"ok": True})
+                return
+            answer_lang = request.get("answer_lang", "rus_Cyrl")
+            model_dir = QWEN_MODELS.get(request.get("model", ""), QWEN_MODEL_DIR)
+            history = normalize_chat_history(request.get("history", []))[-6:]
+            web_context = search_web(text) if request.get("online") else ""
+            _, _, answer = answer_in_lezgi(text, MODEL_DIR, model_dir, history, answer_lang, web_context=web_context)
+            self._send_json(200, {"answer": answer, "sources": extract_source_urls(web_context)})
+        except Exception as exc:
+            self._send_json(500, {"error": str(exc)})
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_server(host: str = "127.0.0.1", port: int = 8765):
+    server = ThreadingHTTPServer((host, port), ChatApiHandler)
+    print(f"Chat API: http://{host}:{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Chat API stopped")
+    finally:
+        server.server_close()
+
+
+def normalize_chat_history(history: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized = []
+    for item in history:
+        role = item.get("role")
+        content = item.get("content", item.get("text", ""))
+        if role in ("user", "assistant") and content:
+            normalized.append({"role": role, "content": str(content)})
+    return normalized
+
+
 class TranslatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("gadz-instruct-lzg | Лезгинский AI-чат")
-        self.root.geometry("900x680")
-        self.root.minsize(620, 480)
-        self.root.configure(bg="#eef2f6")
+        self.root.title("gadz-instruct-lzg")
+        self.root.geometry("1180x760")
+        self.root.minsize(760, 540)
+        self.root.configure(bg="#212121")
         style = ttk.Style()
-        style.configure("App.TFrame", background="#eef2f6")
-        style.configure("Header.TFrame", background="#17324d")
-        style.configure("Title.TLabel", background="#17324d", foreground="white", font=("Segoe UI", 16, "bold"))
-        style.configure("Subtitle.TLabel", background="#17324d", foreground="#c7d5e2")
-        style.configure("Status.TLabel", background="#eef2f6", foreground="#5b6573")
+        style.theme_use("clam")
+        style.configure("App.TFrame", background="#212121")
+        style.configure("Sidebar.TFrame", background="#171717")
+        style.configure("Header.TFrame", background="#212121")
+        style.configure("Title.TLabel", background="#171717", foreground="#f4f4f4", font=("Segoe UI", 15, "bold"))
+        style.configure("Subtitle.TLabel", background="#171717", foreground="#9b9b9b", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#212121", foreground="#8e8e8e", font=("Segoe UI", 9))
+        style.configure("Meta.TLabel", background="#212121", foreground="#a0a0a0", font=("Segoe UI", 9))
+        style.configure("Sidebar.TButton", background="#171717", foreground="#d6d6d6", borderwidth=0, padding=(12, 9), anchor="w")
+        style.map("Sidebar.TButton", background=[("active", "#2a2a2a")])
+        style.configure("Modern.TButton", background="#2f2f2f", foreground="#f2f2f2", borderwidth=0, padding=(10, 7))
+        style.map("Modern.TButton", background=[("active", "#3f3f3f")])
+        style.configure("Modern.TCombobox", fieldbackground="#2f2f2f", background="#2f2f2f", foreground="#f2f2f2", borderwidth=0)
+        style.configure("Modern.TCheckbutton", background="#212121", foreground="#c7c7c7")
 
         self.model_dir = MODEL_DIR
         self.qwen_model_dir = QWEN_MODEL_DIR
-        header = ttk.Frame(root, padding=(18, 14, 18, 14), style="Header.TFrame")
-        header.pack(fill="x")
-        ttk.Label(header, text="gadz-instruct-lzg", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="  Лезгинский AI-чат", style="Subtitle.TLabel").pack(side="left", pady=(4, 0))
-        ttk.Label(header, text="Язык ответа:").pack(side="right", padx=(10, 6))
-        self.answer_combo = ttk.Combobox(header, width=12, state="readonly", values=["Лезгинский", "Русский"])
+        self.internet_var = tk.BooleanVar(value=False)
+        root.grid_rowconfigure(0, weight=1)
+        root.grid_columnconfigure(1, weight=1)
+
+        sidebar = ttk.Frame(root, width=220, style="Sidebar.TFrame", padding=(14, 18))
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+        ttk.Label(sidebar, text="gadz", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(sidebar, text="ЛЕЗГИНСКИЙ AI", style="Subtitle.TLabel").pack(anchor="w", pady=(0, 24))
+        ttk.Button(sidebar, text="＋  Новый чат", style="Sidebar.TButton", command=self.clear_chat).pack(fill="x", pady=(0, 12))
+        ttk.Label(sidebar, text="ЧАТЫ", style="Subtitle.TLabel").pack(anchor="w", padx=12, pady=(12, 8))
+        ttk.Label(sidebar, text="Текущий диалог", style="Sidebar.TLabel").pack(fill="x", padx=12, pady=5)
+        ttk.Label(sidebar, text="\nЛокальная модель\nБез передачи текста", style="Subtitle.TLabel").pack(side="bottom", anchor="w", padx=12)
+
+        content = ttk.Frame(root, style="App.TFrame")
+        content.grid(row=0, column=1, sticky="nsew")
+        content.grid_rowconfigure(1, weight=1)
+        content.grid_columnconfigure(0, weight=1)
+
+        header = ttk.Frame(content, padding=(28, 18, 28, 14), style="Header.TFrame")
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="Новый разговор", foreground="#f4f4f4", background="#212121", font=("Segoe UI", 16, "bold")).pack(side="left")
+        ttk.Label(header, text="  Лезгинский AI-чат", style="Meta.TLabel").pack(side="left", pady=(4, 0))
+        self.speak_btn = ttk.Button(header, text="Озвучить", style="Modern.TButton", command=self.speak_last_answer, state="disabled")
+        self.speak_btn.pack(side="right", padx=(12, 0))
+        ttk.Label(header, text="Язык:", style="Meta.TLabel").pack(side="right", padx=(12, 6))
+        self.answer_combo = ttk.Combobox(header, width=12, state="readonly", values=["Лезгинский", "Русский"], style="Modern.TCombobox")
         self.answer_combo.set("Лезгинский")
         self.answer_combo.pack(side="right")
-        self.speak_btn = ttk.Button(header, text="Озвучить ответ", command=self.speak_last_answer, state="disabled")
-        self.speak_btn.pack(side="right", padx=(8, 0))
-        ttk.Button(header, text="Новый чат", command=self.clear_chat).pack(side="right")
+        ttk.Label(header, text="Модель:", style="Meta.TLabel").pack(side="right", padx=(16, 6))
+        self.model_combo = ttk.Combobox(
+            header, width=20, state="readonly", values=list(QWEN_MODELS), style="Modern.TCombobox"
+        )
+        self.model_combo.set("gadz-instruct-lzg (3B)")
+        self.model_combo.pack(side="left")
+        self.model_combo.bind("<<ComboboxSelected>>", self.change_model)
+        ttk.Checkbutton(header, text="Интернет", variable=self.internet_var, style="Modern.TCheckbutton").pack(side="right", padx=(0, 16))
 
-        chat_frame = ttk.Frame(root, padding=(18, 14, 18, 10), style="App.TFrame")
-        chat_frame.pack(fill="both", expand=True)
+        chat_frame = ttk.Frame(content, padding=(28, 8, 28, 10), style="App.TFrame")
+        chat_frame.grid(row=1, column=0, sticky="nsew")
+        chat_frame.grid_rowconfigure(0, weight=1)
+        chat_frame.grid_columnconfigure(0, weight=1)
         self.chat_text = tk.Text(
             chat_frame,
             wrap="word",
             state="disabled",
-            font=("Segoe UI", 12),
-            padx=14,
-            pady=12,
-            bg="#ffffff",
-            relief="solid",
-            borderwidth=1,
+            font=("Segoe UI", 11),
+            padx=22,
+            pady=18,
+            bg="#212121",
+            fg="#ececec",
+            insertbackground="#ffffff",
+            selectbackground="#3b82f6",
+            relief="flat",
+            borderwidth=0,
         )
-        scrollbar = ttk.Scrollbar(chat_frame, command=self.chat_text.yview)
+        scrollbar = ttk.Scrollbar(chat_frame, command=self.chat_text.yview, orient="vertical")
         self.chat_text.configure(yscrollcommand=scrollbar.set)
-        self.chat_text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.chat_text.tag_configure("user", foreground="#174a7e", spacing3=8)
-        self.chat_text.tag_configure("bot", foreground="#17613a", spacing3=8)
-        self.chat_text.tag_configure("error", foreground="#a32626", spacing3=8)
+        self.chat_text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.chat_text.tag_configure("user", foreground="#78b7ff", spacing3=10)
+        self.chat_text.tag_configure("bot", foreground="#f1f1f1", spacing3=10)
+        self.chat_text.tag_configure("source", foreground="#8fa3b8", spacing3=4)
+        self.chat_text.tag_configure("error", foreground="#ff7b72", spacing3=8)
 
-        input_frame = ttk.Frame(root, padding=(18, 0, 18, 8), style="App.TFrame")
-        input_frame.pack(fill="x")
-        self.input_text = tk.Text(input_frame, height=3, wrap="word", font=("Segoe UI", 12))
+        composer = tk.Frame(content, bg="#2f2f2f", highlightthickness=1, highlightbackground="#454545", highlightcolor="#5b5b5b")
+        composer.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 8))
+        self.input_text = tk.Text(composer, height=3, wrap="word", font=("Segoe UI", 11), bg="#2f2f2f", fg="#f1f1f1", insertbackground="#ffffff", relief="flat", borderwidth=0, padx=14, pady=12)
         self.input_text.pack(side="left", fill="both", expand=True)
         self.input_text.bind("<Return>", self.on_enter)
-        self.send_btn = ttk.Button(input_frame, text="Отправить", command=self.answer_now)
-        self.send_btn.pack(side="right", fill="y", padx=(8, 0))
+        self.send_btn = ttk.Button(composer, text="➤", width=3, style="Modern.TButton", command=self.answer_now)
+        self.send_btn.pack(side="right", fill="y", padx=(0, 8), pady=8)
 
         self.status_var = tk.StringVar(value="Готово")
-        ttk.Label(root, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w", padx=18, pady=(0, 12))
+        ttk.Label(content, textvariable=self.status_var, style="Status.TLabel").grid(row=3, column=0, sticky="w", padx=30, pady=(0, 12))
 
         self._busy = False
         self.russian_history = []
@@ -287,7 +626,10 @@ class TranslatorApp:
             return
 
         self._busy = True
-        answer_lang = "rus_Cyrl" if self.answer_combo.get() == "Русский" else "lez_Cyrl"
+        self.qwen_model_dir = QWEN_MODELS[self.model_combo.get()]
+        use_internet = self.internet_var.get()
+        selected_answer_lang = "rus_Cyrl" if self.answer_combo.get() == "Русский" else "lez_Cyrl"
+        answer_lang = requested_answer_language(text) or selected_answer_lang
         self.status_var.set("Перевожу и формирую ответ...")
         self.send_btn.state(["disabled"])
         self.input_text.delete("1.0", "end")
@@ -298,6 +640,8 @@ class TranslatorApp:
             self.stream_closed = False
         self.streaming_answer = ""
         history = list(self.russian_history)
+        web_context = search_web(text) if use_internet else ""
+        sources = extract_source_urls(web_context)
 
         def worker():
             try:
@@ -311,6 +655,7 @@ class TranslatorApp:
                     history,
                     answer_lang,
                     on_token if answer_lang == "rus_Cyrl" else None,
+                    web_context,
                 )
                 self.russian_history.extend([
                     {"role": "user", "content": russian_question},
@@ -318,9 +663,19 @@ class TranslatorApp:
                 ])
             except Exception as exc:
                 result = f"Ошибка: {exc}"
-            self.root.after(0, lambda: self.show_result(result, streamed=answer_lang == "rus_Cyrl"))
+            self.root.after(
+                0,
+                lambda: self.show_result(
+                    result, streamed=answer_lang == "rus_Cyrl", sources=sources
+                ),
+            )
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def change_model(self, event=None):
+        if not self._busy:
+            self.qwen_model_dir = QWEN_MODELS[self.model_combo.get()]
+            self.status_var.set(f"Выбрана модель: {self.model_combo.get()}")
 
     def add_message(self, author, text, tag):
         self.chat_text.configure(state="normal")
@@ -339,7 +694,7 @@ class TranslatorApp:
         self.chat_text.configure(state="disabled")
         self.chat_text.see("end")
 
-    def show_result(self, result, streamed=False):
+    def show_result(self, result, streamed=False, sources=""):
         tag = "error" if result.startswith("Ошибка:") else "bot"
         if streamed:
             self.chat_text.configure(state="normal")
@@ -349,12 +704,14 @@ class TranslatorApp:
                 self.chat_text.insert("end", f"{result}\n\n")
             else:
                 self.chat_text.insert("end", f"{result}\n\n")
+            if sources:
+                self.chat_text.insert("end", f"Источники:\n{sources}\n\n", "source")
             self.chat_text.configure(state="disabled")
         elif tag == "bot":
             self.add_message("Ассистент", "", tag)
             self.streaming_answer = ""
             self.stream_closed = False
-            self.stream_final_answer(result)
+            self.stream_final_answer(result, sources=sources)
         else:
             self.add_message("Ассистент", result, tag)
         self.last_answer = "" if tag == "error" else result
@@ -366,9 +723,11 @@ class TranslatorApp:
         else:
             self.status_var.set("Вывожу ответ...")
 
-    def stream_final_answer(self, text, position=0):
+    def stream_final_answer(self, text, position=0, sources=""):
         if position >= len(text):
             self.append_stream("\n\n")
+            if sources:
+                self.add_message("Источники", sources, "source")
             self.stream_closed = True
             self.status_var.set("Готово")
             self.send_btn.state(["!disabled"])
@@ -376,7 +735,9 @@ class TranslatorApp:
             return
         chunk = text[position:position + 4]
         self.append_stream(chunk)
-        self.root.after(22, lambda: self.stream_final_answer(text, position + len(chunk)))
+        self.root.after(
+            22, lambda: self.stream_final_answer(text, position + len(chunk), sources)
+        )
 
     def speak_last_answer(self):
         if not self.last_answer or self._busy:
@@ -420,7 +781,13 @@ def main():
     parser.add_argument("--src", default="rus_Cyrl", help="Source language code")
     parser.add_argument("--tgt", default="lez_Cyrl", help="Target language code")
     parser.add_argument("--max-length", type=int, default=128, help="Max generation length")
+    parser.add_argument("--server", action="store_true", help="Run local API for the web interface")
+    parser.add_argument("--port", type=int, default=8765, help="Local API port")
     args = parser.parse_args()
+
+    if args.server:
+        run_server(port=args.port)
+        return
 
     if args.text is not None:
         print(translate(args.text, model_dir=args.model_dir, src_lang=args.src, tgt_lang=args.tgt, max_length=args.max_length))
